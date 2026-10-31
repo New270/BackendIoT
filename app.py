@@ -1,13 +1,22 @@
-from flask import Flask, jsonify, request
+import os
+from functools import wraps
+
+from flask import Flask, g, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 import paho.mqtt.client as mqtt
 import json
 from threading import Timer
 from flask_cors import CORS
+from sqlalchemy import inspect, text
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
 CORS(app) 
+app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'change-this-development-secret')
+app.config['AUTH_TOKEN_MAX_AGE'] = 60 * 60 * 24
+token_serializer = URLSafeTimedSerializer(app.config['SECRET_KEY'])
 
 # ==========================================
 # CẤU HÌNH DATABASE MYSQL
@@ -24,6 +33,7 @@ class User(db.Model):
     full_name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(100), unique=True, nullable=False)
     phone = db.Column(db.String(15), nullable=True)
+    password_hash = db.Column(db.String(255), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Device(db.Model):
@@ -133,22 +143,80 @@ def schedule_action_timeout(action_id):
 # ==========================================
 # REST API - CÁC HÀM XỬ LÝ DỮ LIỆU
 # ==========================================
+def user_payload(user):
+    return {
+        'user_id': user.user_id,
+        'username': user.username,
+        'full_name': user.full_name,
+        'email': user.email,
+    }
+
+
+def create_access_token(user):
+    return token_serializer.dumps({'user_id': user.user_id}, salt='iot-api-auth')
+
+
+def authorization_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        header = request.headers.get('Authorization', '')
+        if not header.startswith('Bearer '):
+            return jsonify({'error': 'Thiếu Authorization: Bearer <token>.'}), 401
+        try:
+            payload = token_serializer.loads(
+                header.removeprefix('Bearer '),
+                salt='iot-api-auth',
+                max_age=app.config['AUTH_TOKEN_MAX_AGE'],
+            )
+            user = db.session.get(User, payload.get('user_id'))
+        except (BadSignature, SignatureExpired):
+            user = None
+        if not user:
+            return jsonify({'error': 'Token không hợp lệ hoặc đã hết hạn.'}), 401
+        g.current_user = user
+        return view(*args, **kwargs)
+    return wrapped
+
+
 @app.route('/api/auth/register', methods=['POST'])
 def api_register():
-    username = request.json.get('username')
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    if len(username) < 3 or len(username) > 50:
+        return jsonify({'error': 'Username phải có từ 3 đến 50 ký tự.'}), 400
+    if len(password) < 6:
+        return jsonify({'error': 'Mật khẩu phải có ít nhất 6 ký tự.'}), 400
     if User.query.filter_by(username=username).first():
         return jsonify({"error": "Tài khoản đã tồn tại!"}), 400
-    db.session.add(User(username=username, full_name=username, email=f"{username}@gmail.com"))
+    user = User(
+        username=username,
+        full_name=username,
+        email=f"{username}@gmail.com",
+        password_hash=generate_password_hash(password),
+    )
+    db.session.add(user)
     db.session.commit()
-    return jsonify({"status": "success"}), 200
+    return jsonify({'status': 'success', 'access_token': create_access_token(user), **user_payload(user)}), 201
 
 @app.route('/api/auth/login', methods=['POST'])
 def api_login():
-    user = User.query.filter_by(username=request.json.get('username')).first()
-    if user: return jsonify({"status": "success", "user_id": user.user_id, "username": user.username}), 200
-    return jsonify({"error": "Tài khoản không tồn tại!"}), 401
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.password_hash or not check_password_hash(user.password_hash, password):
+        return jsonify({'error': 'Username hoặc mật khẩu không đúng.'}), 401
+    return jsonify({'status': 'success', 'access_token': create_access_token(user), **user_payload(user)}), 200
+
+
+@app.route('/api/auth/me', methods=['GET'])
+@authorization_required
+def api_me():
+    return jsonify(user_payload(g.current_user)), 200
 
 @app.route('/api/sensors/latest', methods=['GET'])
+@authorization_required
 def get_latest_sensors():
     temp = SensorData.query.filter_by(sensor_id=1).order_by(SensorData.data_id.desc()).first()
     hum = SensorData.query.filter_by(sensor_id=2).order_by(SensorData.data_id.desc()).first()
@@ -161,6 +229,7 @@ def get_latest_sensors():
 
 
 @app.route('/api/sensors/history', methods=['GET'])
+@authorization_required
 def get_sensor_history():
     data = SensorData.query.order_by(SensorData.data_id.desc()).all()
     result = []
@@ -178,12 +247,14 @@ def get_sensor_history():
 
 # API mới: Lấy trạng thái hiện tại của đèn
 @app.route('/api/devices/status', methods=['GET'])
+@authorization_required
 def get_device_status():
     devices = Device.query.all()
     status_dict = {dev.device_code: dev.status for dev in devices}
     return jsonify(status_dict), 200
 
 @app.route('/api/history', methods=['GET'])
+@authorization_required
 def get_action_history():
     history = ActionHistory.query.order_by(ActionHistory.action_id.desc()).all()
     result = []
@@ -198,9 +269,10 @@ def get_action_history():
     return jsonify(result), 200
 
 @app.route('/api/devices/<device_code>/control', methods=['POST'])
+@authorization_required
 def control_device(device_code):
-    data = request.json
-    action, user_id = data.get('action'), data.get('user_id')
+    data = request.get_json(silent=True) or {}
+    action, user_id = data.get('action'), g.current_user.user_id
 
     device = Device.query.filter_by(device_code=device_code).first()
     if not device: return jsonify({"error": "Device not found"}), 404
@@ -216,11 +288,12 @@ def control_device(device_code):
 
 
 @app.route('/api/devices/bulk_control', methods=['POST'])
+@authorization_required
 def bulk_control_devices():
     try:
-        data = request.json
+        data = request.get_json(silent=True) or {}
         commands = data.get('commands', []) 
-        user_id = data.get('user_id')
+        user_id = g.current_user.user_id
 
         if not commands:
             return jsonify({"error": "No commands provided"}), 400
@@ -255,6 +328,11 @@ def bulk_control_devices():
 
 with app.app_context():
     db.create_all() 
+    # create_all không bổ sung cột vào bảng đã tồn tại.
+    user_columns = {column['name'] for column in inspect(db.engine).get_columns('users')}
+    if 'password_hash' not in user_columns:
+        db.session.execute(text('ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL'))
+        db.session.commit()
     # Seed data (giữ nguyên)
     devices = [{"code": "LED1", "name": "LED Trắng", "type": "LED"}, {"code": "LED2", "name": "LED Xanh Dương", "type": "LED"}, {"code": "LED3", "name": "LED Xanh Lá", "type": "LED"}]
     for d in devices:
